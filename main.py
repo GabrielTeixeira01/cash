@@ -6,29 +6,23 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Prioridade para MYSQL_URL (padrão Railway) sobre DATABASE_URL
+# Configuração de Banco de Dados (Prioridade Railway)
 DATABASE_URL = os.getenv("MYSQL_URL") or os.getenv("DATABASE_URL") or "sqlite:///./test.db"
 
 if DATABASE_URL.startswith("mysql://"):
     DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
 
-# Debug state global
-last_db_error = "Nenhum erro registrado até agora."
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-try:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base = declarative_base()
-except Exception as e:
-    last_db_error = f"Erro na criação da engine: {str(e)}"
-    Base = declarative_base() # Fallback
-
+# --- Modelos do Banco de Dados ---
 class ConsultaCashback(Base):
     __tablename__ = "consultas_cashback"
     id = Column(Integer, primary_key=True, index=True)
@@ -39,6 +33,16 @@ class ConsultaCashback(Base):
     cashback = Column(Float)
     criado_em = Column(DateTime, default=datetime.utcnow)
 
+# --- Esquemas de Dados ---
+class CalcularRequest(BaseModel):
+    nome: str
+    tipo_cliente: str
+    valor: float
+
+class CalcularResponse(BaseModel):
+    cashback: float
+
+# --- Configuração FastAPI ---
 app = FastAPI(title="Cashback API")
 
 app.add_middleware(
@@ -64,45 +68,32 @@ def get_client_ip(request: Request):
 
 @app.on_event("startup")
 def startup_event():
-    global last_db_error
     try:
         if "sqlite" not in DATABASE_URL:
             Base.metadata.create_all(bind=engine)
-            last_db_error = "Banco de dados MySQL conectado e tabelas criadas com sucesso."
     except Exception as e:
-        last_db_error = f"Erro ao criar tabelas no MySQL: {str(e)}"
+        print(f"Erro na conexão com o banco de dados: {e}")
 
-# --- Rotas ---
-
-@app.get("/health")
-def health_check(request: Request):
-    return {
-        "status": "ok",
-        "ip_atual": get_client_ip(request),
-        "banco_info": last_db_error,
-        "database_url_used": DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else "local_sqlite"
-    }
+# --- Rotas da API ---
 
 @app.get("/")
 def serve_frontend():
     if os.path.exists("index.html"):
         return FileResponse("index.html")
-    return {"error": "index.html nao encontrado"}
+    return {"error": "Frontend not found"}
 
-@app.post("/calcular", response_model=CalcularResponse if 'CalcularResponse' in globals() else dict)
-def calcular_cashback(req_data: dict, request: Request, db: Session = Depends(get_db)):
-    global last_db_error
+@app.post("/calcular", response_model=CalcularResponse)
+def calcular_cashback(req_data: CalcularRequest, request: Request, db: Session = Depends(get_db)):
     ip = get_client_ip(request)
     
-    taxa = 0.10 if req_data.get("tipo_cliente", "").lower() == "vip" else 0.05
-    valor = float(req_data.get("valor", 0))
-    valor_cashback = valor * taxa
+    taxa = 0.10 if req_data.tipo_cliente.lower() == "vip" else 0.05
+    valor_cashback = req_data.valor * taxa
     
     nova_consulta = ConsultaCashback(
         ip_usuario=ip,
-        nome=req_data.get("nome", "Sem Nome"),
-        tipo_cliente=req_data.get("tipo_cliente", "NORMAL").upper(),
-        valor=valor,
+        nome=req_data.nome,
+        tipo_cliente=req_data.tipo_cliente.upper(),
+        valor=req_data.valor,
         cashback=valor_cashback
     )
     
@@ -111,9 +102,9 @@ def calcular_cashback(req_data: dict, request: Request, db: Session = Depends(ge
         db.commit()
     except Exception as e:
         db.rollback()
-        last_db_error = f"Falha ao salvar consulta as {datetime.now()}: {str(e)}"
+        print(f"Erro ao salvar consulta: {e}")
     
-    return {"cashback": valor_cashback}
+    return CalcularResponse(cashback=valor_cashback)
 
 @app.get("/historico")
 def obter_historico(request: Request, db: Session = Depends(get_db)):
@@ -128,9 +119,8 @@ def obter_historico(request: Request, db: Session = Depends(get_db)):
             "cashback": c.cashback,
             "criado_em": c.criado_em.isoformat()
         } for c in consultas]}
-    except Exception as e:
-        print(f"ERRO HISTORICO BD: {e}")
-        return {"historico": [], "error": str(e)}
+    except Exception:
+        return {"historico": []}
 
 @app.delete("/historico")
 def limpar_historico(request: Request, db: Session = Depends(get_db)):
@@ -139,9 +129,9 @@ def limpar_historico(request: Request, db: Session = Depends(get_db)):
         db.query(ConsultaCashback).filter(ConsultaCashback.ip_usuario == ip).delete()
         db.commit()
         return {"status": "ok"}
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500)
 
 @app.delete("/historico/{item_id}")
 def deletar_item(item_id: int, request: Request, db: Session = Depends(get_db)):
@@ -149,19 +139,10 @@ def deletar_item(item_id: int, request: Request, db: Session = Depends(get_db)):
     try:
         item = db.query(ConsultaCashback).filter(ConsultaCashback.id == item_id, ConsultaCashback.ip_usuario == ip).first()
         if not item:
-            raise HTTPException(status_code=404, detail="Item não encontrado")
+            raise HTTPException(status_code=404)
         db.delete(item)
         db.commit()
         return {"status": "ok"}
-    except Exception as e:
+    except Exception:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Re-declarando os modelos Pydantic no final para evitar erro de escopo no dict acima se necessário
-class CalcularRequest(BaseModel):
-    nome: str
-    tipo_cliente: str
-    valor: float
-
-class CalcularResponse(BaseModel):
-    cashback: float
+        raise HTTPException(status_code=500)
