@@ -195,8 +195,8 @@
   </div>
 
   <script>
-    // ⚠️ Troque pela URL da sua API no Railway após o deploy
-    const API_URL = "http://localhost:8000";
+    // Como a API e o HTML agora rodam no mesmo servidor, as rotas podem ser relativas
+    const API_URL = "";
 
     function atualizarSaudacao() {
       const nome = document.getElementById("nome").value.trim();
